@@ -15,6 +15,8 @@ class VoiceService {
   String get lastError => _lastError;
 
   Future<bool> initialize() async {
+    if (_isAvailable) return true;
+
     try {
       _isAvailable = await _speechToText.initialize(
         onError: (val) {

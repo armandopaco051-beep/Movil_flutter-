@@ -29,6 +29,17 @@ android {
         versionName = flutter.versionName
     }
 
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            excludes += setOf("**/libggml-vulkan.so")
+        }
+    }
+
+    androidResources {
+        noCompress += "gguf"
+    }
+
     buildTypes {
         release {
             // TODO: Add your own signing config for the release build.

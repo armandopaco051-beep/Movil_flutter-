@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 
 import 'project_schema_manager.dart';
 
@@ -43,14 +45,41 @@ class BackendClient {
   factory BackendClient() => _instance;
   BackendClient._internal();
 
-  // Configuración predeterminada de URL (Puerto 8083 de Spring Boot)
-  String _baseUrl = 'http://10.0.2.2:8086';
+  static const String _settingsFileName = 'backend_settings.json';
+  static const String _defaultBaseUrl = 'http://localhost:8086';
+
+  String _baseUrl = _defaultBaseUrl;
 
   String get baseUrl => _baseUrl;
   set baseUrl(String url) {
-    _baseUrl = url.trim().endsWith('/')
-        ? url.substring(0, url.length - 1)
-        : url.trim();
+    _baseUrl = _normalizeBaseUrl(url);
+  }
+
+  Future<void> initialize() async {
+    try {
+      final file = await _getSettingsFile();
+      if (!await file.exists()) return;
+
+      final decoded = jsonDecode(await file.readAsString());
+      if (decoded is Map<String, dynamic>) {
+        final savedUrl = decoded['baseUrl']?.toString();
+        if (savedUrl != null && savedUrl.trim().isNotEmpty) {
+          _baseUrl = _normalizeBaseUrl(savedUrl);
+        }
+      }
+    } catch (_) {
+      _baseUrl = _defaultBaseUrl;
+    }
+  }
+
+  Future<void> configureBaseUrl(String url) async {
+    _baseUrl = _normalizeBaseUrl(url);
+    final file = await _getSettingsFile();
+    await file.writeAsString(jsonEncode({'baseUrl': _baseUrl}));
+  }
+
+  Future<BackendResponse> checkHealth() {
+    return _sendGet('/api/health');
   }
 
   /// Despachador Universal: resuelve verbo y entidad dinámicamente según el esquema activo
@@ -75,6 +104,14 @@ class BackendClient {
 
     // 1. Resolver el endpoint dinámicamente según el esquema cargado
     final endpoint = _resolveEndpoint(rawEntity);
+    if (endpoint == null) {
+      return BackendResponse.error(
+        method: 'UNKNOWN',
+        endpoint: '/api',
+        error: 'La entidad "$rawEntity" no existe en el esquema activo',
+        statusCode: 400,
+      );
+    }
 
     // 2. Ejecutar según el verbo estándar
     if (rawVerb == 'CREAR' ||
@@ -86,7 +123,9 @@ class BackendClient {
         rawVerb == 'CONSULTAR' ||
         rawVerb == 'OBTENER' ||
         rawVerb == 'VER') {
-      return _sendGet(endpoint);
+      final id =
+          data['id'] ?? data['${rawEntity.toLowerCase()}_id'] ?? data['codigo'];
+      return _sendGet(id == null ? endpoint : '$endpoint/$id');
     } else if (rawVerb == 'ELIMINAR' ||
         rawVerb == 'BORRAR' ||
         rawVerb == 'CANCELAR') {
@@ -130,7 +169,7 @@ class BackendClient {
   }
 
   /// Busca el endpoint exacto en el esquema del proyecto o aplica pluralización inteligente
-  String _resolveEndpoint(String entityName) {
+  String? _resolveEndpoint(String entityName) {
     final activeSchema = ProjectSchemaManager().activeSchema;
     if (activeSchema != null) {
       for (final entity in activeSchema.entities) {
@@ -143,6 +182,8 @@ class BackendClient {
           return entity.endpoint;
         }
       }
+
+      return null;
     }
 
     // Pluralización por defecto en caso de no estar en el esquema
@@ -265,5 +306,22 @@ class BackendClient {
       return '${word}es';
     }
     return '${word}s';
+  }
+
+  String _normalizeBaseUrl(String url) {
+    var normalized = url.trim();
+    if (normalized.isEmpty) return _defaultBaseUrl;
+    if (!normalized.startsWith('http://') &&
+        !normalized.startsWith('https://')) {
+      normalized = 'http://$normalized';
+    }
+    return normalized.endsWith('/')
+        ? normalized.substring(0, normalized.length - 1)
+        : normalized;
+  }
+
+  Future<File> _getSettingsFile() async {
+    final directory = await getApplicationDocumentsDirectory();
+    return File('${directory.path}/$_settingsFileName');
   }
 }

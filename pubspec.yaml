@@ -34,7 +34,7 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
-  llm_llamacpp: ^0.6.0
+  llm_llamacpp: 0.7.0
   http: ^1.6.0
   path_provider: ^2.1.6
   speech_to_text: ^7.5.0
@@ -60,6 +60,11 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # Qwen se distribuye dentro del APK. En el primer inicio Android lo copia
+  # por streaming al almacenamiento privado antes de cargar llama.cpp.
+  assets:
+    - assets/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
   # To add assets to your application, add an assets section, like this:
   # assets:

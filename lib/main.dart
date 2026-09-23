@@ -1,11 +1,12 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
-import 'models/project_schema.dart';
 import 'services/local_ai_service.dart';
 import 'services/voice_service.dart';
 import 'services/backend_client.dart';
+import 'services/backend_discovery_service.dart';
 import 'services/project_schema_manager.dart';
 
 void main() {
@@ -63,11 +64,14 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
   final LocalAiService _aiService = LocalAiService();
   final VoiceService _voiceService = VoiceService();
   final BackendClient _backendClient = BackendClient();
+  final BackendDiscoveryService _discoveryService = BackendDiscoveryService();
   final ProjectSchemaManager _schemaManager = ProjectSchemaManager();
 
   final List<LogEntry> _logs = [];
   bool _isProcessing = false;
   bool _isRecordingVoice = false;
+  bool _backendConnected = false;
+  bool _isDiscovering = false;
 
   @override
   void initState() {
@@ -78,8 +82,36 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
   Future<void> _initServices() async {
     _addLog('SISTEMA', 'Iniciando DrawSchemaAI Mobile...');
 
-    // 1. Cargar esquema guardado en memoria interna del teléfono
+    // 1. Cargar configuracion y ultimo esquema disponible.
+    await _backendClient.initialize();
     await _schemaManager.initialize();
+
+    // 2. Probar la ultima URL y, si ya no responde, buscar el backend en Wi-Fi.
+    final health = await _backendClient.checkHealth();
+    if (health.isSuccess) {
+      _backendConnected = await _schemaManager.fetchFromLocalBackend(
+        _backendClient.baseUrl,
+      );
+      if (_backendConnected) {
+        _addLog(
+          'SISTEMA',
+          'Backend detectado y esquema sincronizado desde ${_backendClient.baseUrl}.',
+        );
+      } else {
+        _addLog(
+          'SISTEMA',
+          'El backend responde, pero no entregó un esquema válido en /api/schema.',
+          isError: true,
+        );
+      }
+    } else {
+      _addLog(
+        'SISTEMA',
+        'La última URL no responde. Buscando backends DrawSchema en la red local...',
+      );
+      await _discoverAndConnect(reportWhenEmpty: true);
+    }
+
     final projectName =
         _schemaManager.activeSchema?.projectName ?? 'Sin Proyecto';
     final entities =
@@ -87,22 +119,10 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
         '';
     _addLog(
       'SISTEMA',
-      '📁 Proyecto Activo (Offline): $projectName\nEntidades disponibles: [$entities]',
+      '📁 Proyecto activo: $projectName\nEntidades disponibles: [$entities]',
     );
 
-    // 2. Inicializar reconocimiento de voz
-    final voiceOk = await _voiceService.initialize();
-    if (voiceOk) {
-      _addLog('SISTEMA', '🎙️ Micrófono listo para captura de voz (es_ES)');
-    } else {
-      _addLog(
-        'SISTEMA',
-        'Micrófono no disponible: ${_voiceService.lastError}',
-        isError: true,
-      );
-    }
-
-    // 3. Inicializar IA Local
+    // 3. Inicializar IA local. El microfono se solicita solo al pulsarlo.
     final aiOk = await _aiService.initialize();
     if (aiOk) {
       _addLog('IA_LOCAL', 'Motor Qwen 2.5 0.5B cargado y listo');
@@ -179,6 +199,15 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
       final action = nluResult.action;
       final datos = nluResult.data;
 
+      if (action == 'NO_ACTION' || action == 'CONSULTA_GENERAL') {
+        _addLog(
+          'IA_LOCAL',
+          datos['respuesta']?.toString() ??
+              'Indícame qué deseas crear, listar, actualizar o eliminar.',
+        );
+        return;
+      }
+
       _addLog(
         'IA_LOCAL',
         'Acción: $action\nDatos: ${const JsonEncoder.withIndent('  ').convert(datos)}',
@@ -186,6 +215,26 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
       );
 
       // 3. Despacho directo a Spring Boot Local
+      if (!_backendConnected) {
+        final health = await _backendClient.checkHealth();
+        _backendConnected = health.isSuccess;
+        if (!_backendConnected) {
+          _addLog(
+            'SISTEMA',
+            'La URL guardada no responde. Buscando el backend automáticamente...',
+          );
+          await _discoverAndConnect(reportWhenEmpty: false);
+        }
+        if (!_backendConnected) {
+          _addLog(
+            'SISTEMA',
+            'No se encontró un Spring Boot disponible. Inícialo en una computadora de la misma red o configura la URL manualmente.',
+            isError: true,
+          );
+          return;
+        }
+      }
+
       _addLog(
         'SISTEMA',
         'Enviando petición a Spring Boot local (${_backendClient.baseUrl})...',
@@ -222,6 +271,15 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
       await _voiceService.stopListening();
       setState(() => _isRecordingVoice = false);
     } else {
+      final voiceOk = await _voiceService.initialize();
+      if (!voiceOk) {
+        _addLog(
+          'SISTEMA',
+          'Micrófono no disponible: ${_voiceService.lastError}',
+          isError: true,
+        );
+        return;
+      }
       setState(() => _isRecordingVoice = true);
       _addLog('SISTEMA', '🎙️ Escuchando... Dicta tu petición.');
 
@@ -244,9 +302,22 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
       'SISTEMA',
       'Intentando sincronizar esquema desde ${_backendClient.baseUrl}/api/schema...',
     );
+    final health = await _backendClient.checkHealth();
+    if (!health.isSuccess) {
+      _backendConnected = false;
+      _addLog(
+        'SISTEMA',
+        'Spring Boot no responde en ${_backendClient.baseUrl}. Revisa el puerto y que el servidor esté iniciado.',
+        isError: true,
+      );
+      setState(() {});
+      return;
+    }
+
     final ok = await _schemaManager.fetchFromLocalBackend(
       _backendClient.baseUrl,
     );
+    _backendConnected = ok;
     if (ok) {
       final pName = _schemaManager.activeSchema?.projectName ?? '';
       final entities =
@@ -254,7 +325,7 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
           '';
       _addLog(
         'SISTEMA',
-        '✅ ¡Esquema sincronizado y guardado en el teléfono!\nProyecto: $pName\nEntidades: [$entities]',
+        'Esquema sincronizado y guardado en el teléfono.\nProyecto: $pName\nEntidades: [$entities]',
       );
       setState(() {});
     } else {
@@ -266,14 +337,108 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
     }
   }
 
-  void _changePreset(ProjectSchema preset) async {
-    await _schemaManager.saveCurrentSchema(preset);
-    final entities = preset.entities.map((e) => e.name).join(', ');
+  Future<bool> _discoverAndConnect({required bool reportWhenEmpty}) async {
+    if (_isDiscovering) return false;
+    if (mounted) setState(() => _isDiscovering = true);
+
+    try {
+      final backends = await _discoveryService.discover();
+      if (backends.isEmpty) {
+        if (reportWhenEmpty) {
+          _addLog(
+            'SISTEMA',
+            'No se encontraron backends DrawSchema por Wi-Fi. Se mantiene ${_backendClient.baseUrl} y el último esquema guardado.',
+            isError: true,
+          );
+        }
+        return false;
+      }
+
+      DiscoveredBackend? selected;
+      if (backends.length == 1) {
+        selected = backends.first;
+      } else if (mounted) {
+        selected = await _showBackendSelector(backends);
+      }
+
+      if (selected == null) {
+        _addLog(
+          'SISTEMA',
+          'Se encontraron ${backends.length} backends. Selecciona uno con el botón de red.',
+        );
+        return false;
+      }
+
+      return await _connectToDiscoveredBackend(selected);
+    } on PlatformException catch (error) {
+      _addLog(
+        'SISTEMA',
+        'No se pudo buscar por mDNS: ${error.message ?? error.code}',
+        isError: reportWhenEmpty,
+      );
+      return false;
+    } catch (error) {
+      _addLog(
+        'SISTEMA',
+        'Falló la búsqueda automática: $error',
+        isError: reportWhenEmpty,
+      );
+      return false;
+    } finally {
+      if (mounted) setState(() => _isDiscovering = false);
+    }
+  }
+
+  Future<bool> _connectToDiscoveredBackend(DiscoveredBackend backend) async {
+    await _backendClient.configureBaseUrl(backend.baseUrl);
+    _backendConnected = false;
     _addLog(
       'SISTEMA',
-      '🔄 Proyecto cambiado a: ${preset.projectName}\nEntidades: [$entities]',
+      'Backend encontrado: ${backend.project} en ${backend.baseUrl}. Validando contrato...',
     );
-    setState(() {});
+    await _syncSchemaFromLocalBackend();
+    return _backendConnected;
+  }
+
+  Future<DiscoveredBackend?> _showBackendSelector(
+    List<DiscoveredBackend> backends,
+  ) {
+    return showDialog<DiscoveredBackend>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1F2E),
+        title: const Text('Seleccionar backend local'),
+        contentPadding: const EdgeInsets.fromLTRB(8, 12, 8, 8),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.separated(
+            shrinkWrap: true,
+            itemCount: backends.length,
+            separatorBuilder: (_, _) => const Divider(height: 1),
+            itemBuilder: (_, index) {
+              final backend = backends[index];
+              return ListTile(
+                leading: const Icon(Icons.dns_outlined),
+                title: Text(backend.project),
+                subtitle: Text(backend.baseUrl),
+                onTap: () => Navigator.pop(ctx, backend),
+              );
+            },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _searchBackends() async {
+    _addLog('SISTEMA', 'Buscando proyectos Spring Boot en la red local...');
+    await _discoverAndConnect(reportWhenEmpty: true);
   }
 
   void _showBackendSettings() {
@@ -288,7 +453,7 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Emulador: http://10.0.2.2:8086\nCable USB (adb reverse): http://localhost:8086\nWi-Fi local: http://192.168.0.4:8086',
+              'La app busca el backend automáticamente. Usa esta URL solo como respaldo.\n\nEmulador: http://10.0.2.2:8086\nCable USB: http://localhost:8086',
               style: TextStyle(fontSize: 12, color: Colors.white60),
             ),
             const SizedBox(height: 12),
@@ -307,15 +472,16 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
             child: const Text('Cancelar'),
           ),
           ElevatedButton(
-            onPressed: () {
-              setState(() {
-                _backendClient.baseUrl = controller.text;
-              });
+            onPressed: () async {
+              await _backendClient.configureBaseUrl(controller.text);
+              _backendConnected = false;
+              if (!ctx.mounted) return;
               Navigator.pop(ctx);
               _addLog(
                 'SISTEMA',
-                'URL de Spring Boot actualizada: ${_backendClient.baseUrl}',
+                'URL guardada: ${_backendClient.baseUrl}. Comprobando conexión...',
               );
+              await _syncSchemaFromLocalBackend();
             },
             child: const Text('Guardar'),
           ),
@@ -346,37 +512,34 @@ class _MainConsoleScreenState extends State<MainConsoleScreen> {
               overflow: TextOverflow.ellipsis,
             ),
             Text(
-              'Backend: ${_backendClient.baseUrl}',
-              style: const TextStyle(fontSize: 11, color: Colors.white60),
+              '${_backendConnected ? 'Conectado' : 'Desconectado'}: ${_backendClient.baseUrl}',
+              style: TextStyle(
+                fontSize: 11,
+                color: _backendConnected
+                    ? const Color(0xFF00E676)
+                    : Colors.white60,
+              ),
+              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),
         actions: [
+          IconButton(
+            icon: _isDiscovering
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.wifi_find, size: 20),
+            tooltip: 'Buscar backend en la red local',
+            onPressed: _isDiscovering ? null : _searchBackends,
+          ),
           // Sincronizar esquema con Spring Boot Local
           IconButton(
             icon: const Icon(Icons.sync_outlined, size: 20),
             tooltip: 'Sincronizar esquema con Spring Boot local',
             onPressed: _syncSchemaFromLocalBackend,
-          ),
-          // Cambiar proyecto / preset offline
-          PopupMenuButton<ProjectSchema>(
-            icon: const Icon(Icons.swap_horiz_rounded, size: 20),
-            tooltip: 'Cambiar proyecto offline',
-            onSelected: _changePreset,
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                value: ProjectSchemaManager.defaultHardwareStoreSchema,
-                child: const Text('Ferretería Industrial'),
-              ),
-              PopupMenuItem(
-                value: ProjectSchemaManager.volleyballClubSchema,
-                child: const Text('Club Voleibol Femenino'),
-              ),
-              PopupMenuItem(
-                value: ProjectSchemaManager.clinicSchema,
-                child: const Text('Clínica Médica'),
-              ),
-            ],
           ),
           IconButton(
             icon: const Icon(Icons.settings, size: 20),

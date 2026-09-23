@@ -46,3 +46,7 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Modelo incluido al compilar el APK. Se obtiene con scripts/download_model.ps1
+# y no se sube directamente a Git porque supera el limite normal de GitHub.
+/assets/models/*.gguf
